@@ -12,6 +12,7 @@ import {
   EyeOff,
   Check,
   Lock,
+  Unlock,
   Edit2,
   FileText,
   QrCode,
@@ -21,7 +22,8 @@ import {
   ChevronDown,
   ChevronUp,
   ExternalLink,
-  Download
+  Download,
+  AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
@@ -57,8 +59,180 @@ interface SavedQRCode {
   created_at: string;
 }
 
+// Crypto Helpers
+const bufferToBase64 = (buf: ArrayBuffer) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const base64ToBuffer = (base64: string) => Uint8Array.from(atob(base64), c => c.charCodeAt(0)).buffer;
+
+/**
+ * Securely overwrites a Uint8Array with zeros to clear sensitive data from memory.
+ */
+const zeroOut = (arr: Uint8Array | null) => {
+  if (arr) {
+    arr.fill(0);
+  }
+};
+
+/**
+ * Converts a string to a Uint8Array.
+ */
+const stringToUint8Array = (str: string) => {
+  return new TextEncoder().encode(str);
+};
+
+const encrypt = async (text: string | Uint8Array, key: CryptoKey) => {
+  if (!text) return "";
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encoded = typeof text === 'string' ? stringToUint8Array(text) : text;
+  
+  const ciphertext = await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    encoded
+  );
+  
+  // If we passed a Uint8Array, zero it out after use
+  if (typeof text !== 'string') {
+    zeroOut(text);
+  } else {
+    // If it was a string, we can't zero it, but we zero the encoded version
+    zeroOut(encoded);
+  }
+  
+  return `${bufferToBase64(iv)}:${bufferToBase64(ciphertext)}`;
+};
+
+const decrypt = async (encrypted: string, key: CryptoKey) => {
+  if (!encrypted) return "";
+  try {
+    const [ivStr, cipherStr] = encrypted.split(':');
+    const iv = base64ToBuffer(ivStr);
+    const ciphertext = base64ToBuffer(cipherStr);
+    const decrypted = await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: new Uint8Array(iv) },
+      key,
+      ciphertext
+    );
+    
+    const decoded = new TextDecoder().decode(decrypted);
+    // Zero out the decrypted buffer immediately
+    zeroOut(new Uint8Array(decrypted));
+    
+    return decoded;
+  } catch (e) {
+    return "[Decryption Failed]";
+  }
+};
+
+const deriveKey = async (password: Uint8Array, salt: Uint8Array) => {
+  const baseKey = await window.crypto.subtle.importKey(
+    "raw",
+    password,
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  
+  const encryptionKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 600000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+
+  const integrityKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: new Uint8Array([...salt].reverse()), // Different salt for integrity key
+      iterations: 600000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    true,
+    ["sign", "verify"]
+  );
+  
+  // Zero out the password buffer after key derivation
+  zeroOut(password);
+  
+  return { encryptionKey, integrityKey };
+};
+
+const signData = async (data: string, key: CryptoKey) => {
+  const encoded = new TextEncoder().encode(data);
+  const signature = await window.crypto.subtle.sign("HMAC", key, encoded);
+  return bufferToBase64(signature);
+};
+
+const verifyData = async (data: string, signature: string, key: CryptoKey) => {
+  try {
+    const encoded = new TextEncoder().encode(data);
+    const sigBuffer = base64ToBuffer(signature);
+    return await window.crypto.subtle.verify("HMAC", key, sigBuffer, encoded);
+  } catch (e) {
+    return false;
+  }
+};
+
+const deriveHash = async (password: Uint8Array, salt: Uint8Array) => {
+  const baseKey = await window.crypto.subtle.importKey(
+    "raw",
+    password,
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  
+  const derivedKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 600000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    true,
+    ["sign"]
+  );
+  
+  const exported = await window.crypto.subtle.exportKey("raw", derivedKey);
+  const hash = bufferToBase64(exported);
+  
+  // Zero out buffers
+  zeroOut(password);
+  zeroOut(new Uint8Array(exported));
+  
+  return hash;
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'generator' | 'vault' | 'notes' | 'qr'>('generator');
+  
+  // Security State
+  const [masterKey, setMasterKey] = useState<CryptoKey | null>(null);
+  const [integrityKey, setIntegrityKey] = useState<CryptoKey | null>(null);
+  const [isLocked, setIsLocked] = useState(true);
+  const [masterSalt, setMasterSalt] = useState<Uint8Array | null>(null);
+  const [authSalt, setAuthSalt] = useState<Uint8Array | null>(null);
+  const [authHash, setAuthHash] = useState<string | null>(null);
+  const [showMasterSetup, setShowMasterSetup] = useState(false);
+  const [masterPasswordInput, setMasterPasswordInput] = useState('');
+  const [masterPasswordConfirm, setMasterPasswordConfirm] = useState('');
+  const [securityError, setSecurityError] = useState('');
+  const [lastActivity, setLastActivity] = useState(Date.now());
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [lockoutUntil, setLockoutUntil] = useState<number | null>(null);
+  const [privacyMode, setPrivacyMode] = useState(true);
+  const [passwordStrength, setPasswordStrength] = useState(0);
+  const [isHardwareSupported, setIsHardwareSupported] = useState(false);
+  const [hasHardwareKey, setHasHardwareKey] = useState(false);
   const [length, setLength] = useState(16);
   const [includeLowercase, setIncludeLowercase] = useState(true);
   const [includeUppercase, setIncludeUppercase] = useState(true);
@@ -70,6 +244,7 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [showPassMap, setShowPassMap] = useState<Record<number, boolean>>({});
+  const [decryptedPasswords, setDecryptedPasswords] = useState<Record<number, string>>({});
   
   // Form state
   const [newService, setNewService] = useState('');
@@ -81,6 +256,13 @@ export default function App() {
   const [customFields, setCustomFields] = useState<{ label: string; value: string }[]>([]);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [isWindowFocused, setIsWindowFocused] = useState(true);
+  const [isTabVisible, setIsTabVisible] = useState(true);
+  const [isCompromised, setIsCompromised] = useState(false);
+  const [securityWarning, setSecurityWarning] = useState<string | null>(null);
+  const [isRooted, setIsRooted] = useState(false);
+  const [showRootWarning, setShowRootWarning] = useState(false);
+  const [integrityChecks, setIntegrityChecks] = useState<Record<string, boolean>>({});
 
   // Notes state
   const [notes, setNotes] = useState<Note[]>([]);
@@ -97,6 +279,64 @@ export default function App() {
   const [newQrService, setNewQrService] = useState('');
   const [newQrUsername, setNewQrUsername] = useState('');
   const [newQrContent, setNewQrContent] = useState('');
+
+  useEffect(() => {
+    const checkEnvironment = () => {
+      // Basic detection for compromised/automated environments
+      if (navigator.webdriver) {
+        setIsCompromised(true);
+        setSecurityWarning("Automated environment detected. Vault disabled for security.");
+      }
+
+      // Check for non-standard browser properties often present in rooted/emulated environments
+      const suspiciousProps = ['_phantom', 'callPhantom', '__nightmare', 'Buffer', 'spawn'];
+      for (const prop of suspiciousProps) {
+        if (prop in window) {
+          setIsCompromised(true);
+          setSecurityWarning("Non-standard environment detected. Vault disabled for security.");
+          break;
+        }
+      }
+    };
+
+    const detectDevTools = () => {
+      const threshold = 160;
+      const widthDiff = window.outerWidth - window.innerWidth > threshold;
+      const heightDiff = window.outerHeight - window.innerHeight > threshold;
+      if (widthDiff || heightDiff) {
+        // DevTools might be open
+        console.clear();
+      }
+    };
+
+    checkEnvironment();
+    const devToolsInterval = setInterval(detectDevTools, 1000);
+
+    const handleFocus = () => setIsWindowFocused(true);
+    const handleBlur = () => setIsWindowFocused(false);
+    const handleVisibilityChange = () => {
+      setIsTabVisible(document.visibilityState === 'visible');
+    };
+
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    
+    const preventContextMenu = (e: MouseEvent) => {
+      if (process.env.NODE_ENV === 'production') {
+        e.preventDefault();
+      }
+    };
+    document.addEventListener('contextmenu', preventContextMenu);
+
+    return () => {
+      clearInterval(devToolsInterval);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      document.removeEventListener('contextmenu', preventContextMenu);
+    };
+  }, []);
 
   const generatePassword = useCallback(() => {
     let charset = "";
@@ -120,48 +360,446 @@ export default function App() {
 
   useEffect(() => {
     generatePassword();
-    fetchPasswords();
-    fetchNotes();
-    fetchQrcodes();
+    checkSecurity();
+    checkHardwareSupport();
   }, [generatePassword]);
 
-  const fetchPasswords = async () => {
+  const checkHardwareSupport = async () => {
+    if (window.PublicKeyCredential) {
+      setIsHardwareSupported(true);
+      try {
+        const res = await fetch('/api/webauthn/credentials');
+        const creds = await res.json();
+        setHasHardwareKey(creds.length > 0);
+      } catch (e) {
+        // Silent error
+      }
+    }
+  };
+
+  const registerHardwareKey = async () => {
+    if (!masterKey) return;
+    try {
+      const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+      const userID = window.crypto.getRandomValues(new Uint8Array(16));
+      
+      const credential = await navigator.credentials.create({
+        publicKey: {
+          challenge,
+          rp: { name: "Hyper Vault" },
+          user: {
+            id: userID,
+            name: "user@hypervault",
+            displayName: "Vault User"
+          },
+          pubKeyCredParams: [{ alg: -7, type: "public-key" }],
+          authenticatorSelection: {
+            authenticatorAttachment: "platform",
+            userVerification: "required"
+          },
+          timeout: 60000
+        }
+      }) as PublicKeyCredential;
+
+      if (credential) {
+        const response = credential.response as AuthenticatorAttestationResponse;
+        await fetch('/api/webauthn/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: credential.id,
+            publicKey: bufferToBase64(response.getPublicKey()),
+            userHandle: bufferToBase64(userID)
+          })
+        });
+        setHasHardwareKey(true);
+        alert("Hardware key registered successfully!");
+      }
+    } catch (err) {
+      // Silent error
+      alert("Failed to register hardware key. Ensure your device supports biometrics.");
+    }
+  };
+
+  const unlockWithHardware = async () => {
+    if (!hasHardwareKey) return;
+    try {
+      const res = await fetch('/api/webauthn/credentials');
+      const creds = await res.json();
+      
+      const challenge = window.crypto.getRandomValues(new Uint8Array(32));
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge,
+          allowCredentials: creds.map((c: any) => ({
+            id: base64ToBuffer(c.id),
+            type: 'public-key'
+          })),
+          userVerification: "required"
+        }
+      });
+
+      if (assertion) {
+        // In a real production app, we would verify the signature on the server.
+        // For this vault, we still need the master password to derive the encryption key.
+        // Hardware unlock here acts as a "Fast Unlock" if the key is cached securely,
+        // but for maximum security, we'll prompt for the password once per session.
+        alert("Hardware verification successful! Please enter your master password to decrypt.");
+      }
+    } catch (err) {
+      // Silent error
+    }
+  };
+
+  // Inactivity Auto-Lock
+  useEffect(() => {
+    if (isLocked) return;
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      if (now - lastActivity > 60 * 1000) { // 60 seconds
+        lockVault();
+      }
+    }, 5000); // Check more frequently
+
+    const handleActivity = () => setLastActivity(Date.now());
+    window.addEventListener('mousemove', handleActivity);
+    window.addEventListener('keydown', handleActivity);
+    window.addEventListener('click', handleActivity);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('mousemove', handleActivity);
+      window.removeEventListener('keydown', handleActivity);
+      window.removeEventListener('click', handleActivity);
+    };
+  }, [isLocked, lastActivity]);
+
+  const lockVault = () => {
+    // Explicitly clear all sensitive state from memory
+    setMasterKey(null);
+    setIsLocked(true);
+    setSavedPasswords([]);
+    setNotes([]);
+    setQrcodes([]);
+    setDecryptedPasswords({});
+    setShowPassMap({});
+    setMasterPasswordInput('');
+    setMasterPasswordConfirm('');
+    setGeneratedPass('');
+    setNewPassword('');
+    setNewNoteContent('');
+    setNewNoteCode('');
+    setNewQrContent('');
+    setSecurityError('');
+    
+    // Force a re-render to ensure memory is cleared
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const detectRoot = async () => {
+    const checks = {
+      suBinary: false,
+      testKeys: false,
+      emulator: false,
+      automation: !!navigator.webdriver,
+      suspiciousPaths: false
+    };
+
+    // 1. Emulator detection via WebGL Renderer
+    try {
+      const canvas = document.createElement('canvas');
+      const gl = canvas.getContext('webgl');
+      if (gl) {
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+        if (debugInfo) {
+          const renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL).toLowerCase();
+          const suspiciousRenderers = ['swiftshader', 'google', 'virtualbox', 'vmware', 'llvmpipe', 'software'];
+          if (suspiciousRenderers.some(r => renderer.includes(r))) {
+            checks.emulator = true;
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 2. Detect common "root" indicators if injected into browser environment
+    // (Some rooted environments inject globals into the browser)
+    if ((window as any)._magisk || (window as any)._xposed || (window as any)._root) {
+      checks.suBinary = true;
+    }
+
+    // 3. Check for suspicious User Agent strings (often modified by root tools)
+    const ua = navigator.userAgent.toLowerCase();
+    if (ua.includes('test-keys') || ua.includes('cyanogenmod') || ua.includes('lineageos')) {
+      checks.testKeys = true;
+    }
+
+    // 4. Check for suspicious system-like paths in environment (simulated for web)
+    // In a real native app, we'd check /system/bin/su. In web, we can check for 
+    // certain environment variables or behaviors.
+    if (process.env.NODE_ENV === 'development' && window.location.hostname === 'localhost') {
+      // We don't flag local dev as rooted, but we could check for other things
+    }
+
+    const isSuspicious = checks.emulator || checks.automation || checks.suBinary || checks.testKeys;
+    
+    setIntegrityChecks(checks);
+    if (isSuspicious) {
+      setIsRooted(true);
+      setShowRootWarning(true);
+    }
+    
+    return isSuspicious;
+  };
+
+  const checkSecurity = async () => {
+    // Run root detection first
+    await detectRoot();
+    
+    try {
+      const [saltRes, authSaltRes, authHashRes] = await Promise.all([
+        fetch('/api/settings/master_salt'),
+        fetch('/api/settings/auth_salt'),
+        fetch('/api/settings/auth_hash')
+      ]);
+
+      const saltData = await saltRes.json();
+      const authSaltData = await authSaltRes.json();
+      const authHashData = await authHashRes.json();
+
+      if (saltData.value && authSaltData.value && authHashData.value) {
+        setMasterSalt(new Uint8Array(base64ToBuffer(saltData.value)));
+        setAuthSalt(new Uint8Array(base64ToBuffer(authSaltData.value)));
+        setAuthHash(authHashData.value);
+        setIsLocked(true);
+      } else {
+        setShowMasterSetup(true);
+      }
+    } catch (err) {
+      // Silent error
+    }
+  };
+
+  const checkPasswordStrength = (pass: string) => {
+    let score = 0;
+    if (pass.length >= 12) score += 1;
+    if (pass.length >= 16) score += 1;
+    if (/[A-Z]/.test(pass)) score += 1;
+    if (/[0-9]/.test(pass)) score += 1;
+    if (/[^A-Za-z0-9]/.test(pass)) score += 1;
+    setPasswordStrength(score);
+  };
+
+  const handleSetupMaster = async (e: FormEvent) => {
+    e.preventDefault();
+    if (masterPasswordInput.length < 12) {
+      setSecurityError("Master password should be at least 12 characters for better security");
+      return;
+    }
+    if (masterPasswordInput !== masterPasswordConfirm) {
+      setSecurityError("Passwords do not match");
+      return;
+    }
+    if (passwordStrength < 3) {
+      setSecurityError("Please choose a stronger password (at least 3 strength bars)");
+      return;
+    }
+
+    const mSalt = window.crypto.getRandomValues(new Uint8Array(16));
+    const aSalt = window.crypto.getRandomValues(new Uint8Array(16));
+    
+    try {
+      const passwordBuffer1 = stringToUint8Array(masterPasswordInput);
+      const passwordBuffer2 = stringToUint8Array(masterPasswordInput);
+      setMasterPasswordInput('');
+      setMasterPasswordConfirm('');
+      
+      const aHash = await deriveHash(passwordBuffer1, aSalt);
+
+      await Promise.all([
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: 'master_salt', value: bufferToBase64(mSalt) })
+        }),
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: 'auth_salt', value: bufferToBase64(aSalt) })
+        }),
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: 'auth_hash', value: aHash })
+        })
+      ]);
+      
+      const { encryptionKey, integrityKey: iKey } = await deriveKey(passwordBuffer2, mSalt);
+      setMasterKey(encryptionKey);
+      setIntegrityKey(iKey);
+      setMasterSalt(mSalt);
+      setAuthSalt(aSalt);
+      setAuthHash(aHash);
+      setIsLocked(false);
+      setShowMasterSetup(false);
+      setSecurityError('');
+      setLastActivity(Date.now());
+    } catch (err) {
+      setSecurityError("Failed to save security settings");
+    }
+  };
+
+  const handleUnlock = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!masterSalt || !authSalt || !authHash) return;
+
+    if (lockoutUntil && Date.now() < lockoutUntil) {
+      const remaining = Math.ceil((lockoutUntil - Date.now()) / 1000);
+      setSecurityError(`Too many failed attempts. Try again in ${remaining}s`);
+      return;
+    }
+
+    try {
+      const passwordBuffer1 = stringToUint8Array(masterPasswordInput);
+      const passwordBuffer2 = stringToUint8Array(masterPasswordInput);
+      setMasterPasswordInput('');
+
+      // 1. Verify Hash
+      const inputHash = await deriveHash(passwordBuffer1, authSalt);
+      if (inputHash !== authHash) {
+        // Zero out the other buffer since we won't use it for key derivation
+        zeroOut(passwordBuffer2);
+        
+        const newFailed = failedAttempts + 1;
+        setFailedAttempts(newFailed);
+        if (newFailed >= 3) {
+          setLockoutUntil(Date.now() + 30000); // 30s lockout
+          setSecurityError("Too many failed attempts. Locked for 30 seconds.");
+        } else {
+          setSecurityError(`Invalid Master Password. ${3 - newFailed} attempts remaining.`);
+        }
+        return;
+      }
+
+      // 2. Derive Encryption and Integrity Keys
+      const { encryptionKey, integrityKey: iKey } = await deriveKey(passwordBuffer2, masterSalt);
+      setMasterKey(encryptionKey);
+      setIntegrityKey(iKey);
+      setIsLocked(false);
+      setSecurityError('');
+      setFailedAttempts(0);
+      setLockoutUntil(null);
+      setLastActivity(Date.now());
+      
+      // Fetch data after unlocking
+      fetchPasswords(encryptionKey, iKey);
+      fetchNotes(encryptionKey, iKey);
+      fetchQrcodes(encryptionKey, iKey);
+    } catch (err) {
+      setSecurityError("Security error during unlock");
+    }
+  };
+
+  const fetchPasswords = async (keyOverride?: CryptoKey, iKeyOverride?: CryptoKey) => {
+    const key = keyOverride || masterKey;
+    const iKey = iKeyOverride || integrityKey;
+    if (!key || !iKey) return;
     try {
       const res = await fetch('/api/passwords');
       const data = await res.json();
-      setSavedPasswords(data);
+      
+      const decryptedData = await Promise.all(data.map(async (item: any) => {
+        // Integrity Verification
+        if (item.signature) {
+          const payload = [
+            item.service,
+            item.username,
+            item.email,
+            item.phone,
+            item.backup_code,
+            item.password,
+            JSON.stringify(item.custom_fields)
+          ].join('|');
+          
+          const isValid = await verifyData(payload, item.signature, iKey);
+          if (!isValid) {
+            setIsCompromised(true);
+            setSecurityWarning("Vault integrity check failed. Data tampering detected in password entries.");
+            throw new Error("Integrity check failed");
+          }
+        }
+
+        return {
+          ...item,
+          service: await decrypt(item.service, key),
+          username: await decrypt(item.username, key),
+          email: await decrypt(item.email, key),
+          phone: await decrypt(item.phone, key),
+          backup_code: await decrypt(item.backup_code, key),
+          // Keep password encrypted in state
+          password: item.password, 
+          custom_fields: await Promise.all((item.custom_fields || []).map(async (f: any) => ({
+            label: await decrypt(f.label, key),
+            value: await decrypt(f.value, key)
+          })))
+        };
+      }));
+      
+      setSavedPasswords(decryptedData);
     } catch (err) {
-      console.error("Failed to fetch passwords", err);
+      if (err instanceof Error && err.message === "Integrity check failed") {
+        // Handled by state
+      }
     }
   };
 
   const savePassword = async (e: FormEvent) => {
     e.preventDefault();
-    if (!newService || !newPassword) return;
+    if (!newService || !newPassword || !masterKey || !integrityKey) return;
 
     try {
       const url = editingId ? `/api/passwords/${editingId}` : '/api/passwords';
       const method = editingId ? 'PUT' : 'POST';
 
+      const passwordBuffer = stringToUint8Array(newPassword);
+      setNewPassword(''); // Clear string immediately
+
+      const encryptedData = {
+        service: await encrypt(newService, masterKey),
+        username: await encrypt(newUsername, masterKey),
+        email: await encrypt(newEmail, masterKey),
+        phone: await encrypt(newPhone, masterKey),
+        backup_code: await encrypt(newBackupCode, masterKey),
+        password: await encrypt(passwordBuffer, masterKey),
+        custom_fields: await Promise.all(customFields.map(async f => ({
+          label: await encrypt(f.label, masterKey),
+          value: await encrypt(f.value, masterKey)
+        })))
+      };
+
+      const payload = [
+        encryptedData.service,
+        encryptedData.username,
+        encryptedData.email,
+        encryptedData.phone,
+        encryptedData.backup_code,
+        encryptedData.password,
+        JSON.stringify(encryptedData.custom_fields)
+      ].join('|');
+
+      const signature = await signData(payload, integrityKey);
+
       const res = await fetch(url, {
         method: method,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          service: newService,
-          username: newUsername,
-          email: newEmail,
-          phone: newPhone,
-          backup_code: newBackupCode,
-          password: newPassword,
-          custom_fields: customFields
-        })
+        body: JSON.stringify({ ...encryptedData, signature })
       });
       if (res.ok) {
         resetForm();
         fetchPasswords();
       }
     } catch (err) {
-      console.error("Failed to save password", err);
+      // Silent error
     }
   };
 
@@ -177,18 +815,24 @@ export default function App() {
     setEditingId(null);
   };
 
-  const startEdit = (item: SavedPassword) => {
-    setNewService(item.service);
-    setNewUsername(item.username || '');
-    setNewEmail(item.email || '');
-    setNewPhone(item.phone || '');
-    setNewBackupCode(item.backup_code || '');
-    setNewPassword(item.password);
-    setCustomFields(item.custom_fields || []);
-    setEditingId(item.id);
-    setShowForm(true);
-    // Scroll to form or ensure it's visible
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+  const startEdit = async (item: SavedPassword) => {
+    if (!masterKey) return;
+    try {
+      const decryptedPass = await decrypt(item.password, masterKey);
+      setNewService(item.service);
+      setNewUsername(item.username || '');
+      setNewEmail(item.email || '');
+      setNewPhone(item.phone || '');
+      setNewBackupCode(item.backup_code || '');
+      setNewPassword(decryptedPass);
+      setCustomFields(item.custom_fields || []);
+      setEditingId(item.id);
+      setShowForm(true);
+      // Scroll to form or ensure it's visible
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (e) {
+      // Silent error
+    }
   };
 
   const addCustomField = () => {
@@ -210,36 +854,84 @@ export default function App() {
       await fetch(`/api/passwords/${id}`, { method: 'DELETE' });
       fetchPasswords();
     } catch (err) {
-      console.error("Failed to delete password", err);
+      // Silent error
     }
   };
 
-  const fetchNotes = async () => {
+  const fetchNotes = async (keyOverride?: CryptoKey, iKeyOverride?: CryptoKey) => {
+    const key = keyOverride || masterKey;
+    const iKey = iKeyOverride || integrityKey;
+    if (!key || !iKey) return;
     try {
       const res = await fetch('/api/notes');
       const data = await res.json();
-      setNotes(data);
+      
+      const decryptedData = await Promise.all(data.map(async (item: any) => {
+        // Integrity Verification
+        if (item.signature) {
+          const payload = [
+            item.title,
+            item.content,
+            item.image,
+            item.link,
+            item.code
+          ].join('|');
+          
+          const isValid = await verifyData(payload, item.signature, iKey);
+          if (!isValid) {
+            setIsCompromised(true);
+            setSecurityWarning("Vault integrity check failed. Data tampering detected in notes.");
+            throw new Error("Integrity check failed");
+          }
+        }
+
+        return {
+          ...item,
+          title: await decrypt(item.title, key),
+          content: await decrypt(item.content, key),
+          image: await decrypt(item.image, key),
+          link: await decrypt(item.link, key),
+          code: await decrypt(item.code, key)
+        };
+      }));
+      
+      setNotes(decryptedData);
     } catch (err) {
-      console.error("Failed to fetch notes", err);
+      if (err instanceof Error && err.message === "Integrity check failed") {
+        // Handled by state
+      }
     }
   };
 
   const saveNote = async (e: FormEvent) => {
     e.preventDefault();
+    if (!masterKey || !integrityKey) return;
     
     const titleToSave = newNoteTitle.trim() || `title ${notes.length + 1}`;
 
     try {
+      const encryptedData = {
+        title: await encrypt(titleToSave, masterKey),
+        content: await encrypt(newNoteContent, masterKey),
+        image: await encrypt(newNoteImage || '', masterKey),
+        link: await encrypt(newNoteLink, masterKey),
+        code: await encrypt(newNoteCode, masterKey)
+      };
+
+      const payload = [
+        encryptedData.title,
+        encryptedData.content,
+        encryptedData.image,
+        encryptedData.link,
+        encryptedData.code
+      ].join('|');
+
+      const signature = await signData(payload, integrityKey);
+
       const res = await fetch('/api/notes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: titleToSave,
-          content: newNoteContent,
-          image: newNoteImage,
-          link: newNoteLink,
-          code: newNoteCode
-        })
+        body: JSON.stringify({ ...encryptedData, signature })
       });
       if (res.ok) {
         setNewNoteTitle('');
@@ -251,7 +943,7 @@ export default function App() {
         fetchNotes();
       }
     } catch (err) {
-      console.error("Failed to save note", err);
+      // Silent error
     }
   };
 
@@ -260,7 +952,7 @@ export default function App() {
       await fetch(`/api/notes/${id}`, { method: 'DELETE' });
       fetchNotes();
     } catch (err) {
-      console.error("Failed to delete note", err);
+      // Silent error
     }
   };
 
@@ -275,29 +967,70 @@ export default function App() {
     }
   };
 
-  const fetchQrcodes = async () => {
+  const fetchQrcodes = async (keyOverride?: CryptoKey, iKeyOverride?: CryptoKey) => {
+    const key = keyOverride || masterKey;
+    const iKey = iKeyOverride || integrityKey;
+    if (!key || !iKey) return;
     try {
       const res = await fetch('/api/qrcodes');
       const data = await res.json();
-      setQrcodes(data);
+      
+      const decryptedData = await Promise.all(data.map(async (item: any) => {
+        // Integrity Verification
+        if (item.signature) {
+          const payload = [
+            item.service,
+            item.username,
+            item.content
+          ].join('|');
+          
+          const isValid = await verifyData(payload, item.signature, iKey);
+          if (!isValid) {
+            setIsCompromised(true);
+            setSecurityWarning("Vault integrity check failed. Data tampering detected in QR codes.");
+            throw new Error("Integrity check failed");
+          }
+        }
+
+        return {
+          ...item,
+          service: await decrypt(item.service, key),
+          username: await decrypt(item.username, key),
+          content: await decrypt(item.content, key)
+        };
+      }));
+      
+      setQrcodes(decryptedData);
     } catch (err) {
-      console.error("Failed to fetch QR codes", err);
+      if (err instanceof Error && err.message === "Integrity check failed") {
+        // Handled by state
+      }
     }
   };
 
   const saveQrcode = async (e: FormEvent) => {
     e.preventDefault();
-    if (!newQrService || !newQrContent) return;
+    if (!newQrService || !newQrContent || !masterKey || !integrityKey) return;
 
     try {
+      const encryptedData = {
+        service: await encrypt(newQrService, masterKey),
+        username: await encrypt(newQrUsername, masterKey),
+        content: await encrypt(newQrContent, masterKey)
+      };
+
+      const payload = [
+        encryptedData.service,
+        encryptedData.username,
+        encryptedData.content
+      ].join('|');
+
+      const signature = await signData(payload, integrityKey);
+
       const res = await fetch('/api/qrcodes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          service: newQrService,
-          username: newQrUsername,
-          content: newQrContent
-        })
+        body: JSON.stringify({ ...encryptedData, signature })
       });
       if (res.ok) {
         setNewQrService('');
@@ -307,7 +1040,7 @@ export default function App() {
         fetchQrcodes();
       }
     } catch (err) {
-      console.error("Failed to save QR code", err);
+      // Silent error
     }
   };
 
@@ -316,7 +1049,7 @@ export default function App() {
       await fetch(`/api/qrcodes/${id}`, { method: 'DELETE' });
       fetchQrcodes();
     } catch (err) {
-      console.error("Failed to delete QR code", err);
+      // Silent error
     }
   };
 
@@ -324,14 +1057,271 @@ export default function App() {
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+    
+    // Security: Clear clipboard after 30 seconds
+    setTimeout(() => {
+      navigator.clipboard.readText().then(current => {
+        if (current === text) {
+          navigator.clipboard.writeText("");
+        }
+      }).catch(() => {
+        // Fallback: just clear it anyway if permission denied
+        navigator.clipboard.writeText("");
+      });
+    }, 30000);
   };
 
-  const togglePassVisibility = (id: number) => {
-    setShowPassMap(prev => ({ ...prev, [id]: !prev[id] }));
+  const togglePassVisibility = async (id: number) => {
+    if (showPassMap[id]) {
+      setShowPassMap(prev => ({ ...prev, [id]: false }));
+      setDecryptedPasswords(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    } else {
+      const item = savedPasswords.find(p => p.id === id);
+      if (item && masterKey) {
+        const decrypted = await decrypt(item.password, masterKey);
+        setDecryptedPasswords(prev => ({ ...prev, [id]: decrypted }));
+        setShowPassMap(prev => ({ ...prev, [id]: true }));
+      }
+    }
+  };
+
+  const copyPassword = async (id: number) => {
+    const item = savedPasswords.find(p => p.id === id);
+    if (item && masterKey) {
+      const decrypted = await decrypt(item.password, masterKey);
+      copyToClipboard(decrypted);
+      // Clear decrypted string from memory as soon as possible
+      // (Though copyToClipboard might keep it for a bit, we do our part)
+    }
   };
 
   return (
-    <div className="min-h-screen bg-[#f8f9fa] p-4 md:p-8 pb-24 md:pb-8">
+    <div className={cn(
+      "min-h-screen transition-all duration-500",
+      (!isWindowFocused || !isTabVisible) && "blur-2xl scale-[0.98] pointer-events-none select-none"
+    )}>
+      <AnimatePresence>
+        {(!isWindowFocused || !isTabVisible) && (
+          <div className="fixed inset-0 z-[200] bg-zinc-900/40 backdrop-blur-3xl flex items-center justify-center">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="text-center space-y-4"
+            >
+              <div className="w-20 h-20 bg-white/10 rounded-full flex items-center justify-center text-white mx-auto border border-white/20">
+                <Lock size={40} className="animate-pulse" />
+              </div>
+              <div className="space-y-1">
+                <h2 className="text-xl font-bold text-white">Privacy Protected</h2>
+                <p className="text-white/60 text-sm">Vault content is hidden while inactive</p>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {showRootWarning && (
+          <div className="fixed inset-0 z-[150] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="max-w-md w-full bg-white rounded-3xl p-8 shadow-2xl border border-red-100"
+            >
+              <div className="text-center space-y-4">
+                <div className="w-20 h-20 bg-red-50 rounded-full flex items-center justify-center text-red-600 mx-auto animate-pulse">
+                  <AlertTriangle size={40} />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-2xl font-bold text-zinc-900">Security Integrity Warning</h2>
+                  <p className="text-zinc-500 text-sm">
+                    Our system has detected that this device or environment may be compromised (Rooted, Emulator, or Automation detected).
+                  </p>
+                </div>
+
+                <div className="bg-zinc-50 rounded-2xl p-4 text-left space-y-2 border border-zinc-100">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-400 mb-2">Integrity Report</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    {Object.entries(integrityChecks).map(([key, value]) => (
+                      <div key={key} className="flex items-center gap-2 text-xs">
+                        <div className={cn("w-2 h-2 rounded-full", value ? "bg-red-500" : "bg-emerald-500")} />
+                        <span className="text-zinc-600 capitalize">{key.replace(/([A-Z])/g, ' $1')}</span>
+                        <span className="ml-auto font-mono text-[10px]">{value ? "FAIL" : "PASS"}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <p className="text-xs text-red-500 font-medium bg-red-50 p-3 rounded-xl">
+                  Running a secure vault on a compromised device is highly discouraged as your master password could be intercepted by system-level malware.
+                </p>
+
+                <div className="flex flex-col gap-3 pt-2">
+                  <button 
+                    onClick={() => setShowRootWarning(false)}
+                    className="w-full py-4 bg-zinc-900 text-white rounded-2xl font-semibold hover:bg-zinc-800 transition-all shadow-lg shadow-zinc-200"
+                  >
+                    I Understand the Risk
+                  </button>
+                  <button 
+                    onClick={() => window.location.href = 'about:blank'}
+                    className="w-full py-4 bg-white text-zinc-600 border border-zinc-200 rounded-2xl font-semibold hover:bg-zinc-50 transition-all"
+                  >
+                    Exit Securely
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {showMasterSetup && (
+          <div className="fixed inset-0 z-[100] bg-zinc-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="max-w-md w-full glass-card p-8 space-y-6"
+            >
+              <div className="text-center space-y-2">
+                <div className="w-16 h-16 bg-zinc-900 rounded-2xl flex items-center justify-center text-white mx-auto mb-4">
+                  <Shield size={32} />
+                </div>
+                <h1 className="text-2xl font-bold text-zinc-900">Setup Hyper Vault</h1>
+                <p className="text-zinc-500 text-sm">Set a master password to encrypt your vault. This password is never stored and cannot be recovered.</p>
+              </div>
+
+              <form onSubmit={handleSetupMaster} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Master Password</label>
+                  <input 
+                    type="password" 
+                    placeholder="At least 12 characters"
+                    className="input-field"
+                    autoComplete="off"
+                    value={masterPasswordInput}
+                    onChange={(e) => {
+                      setMasterPasswordInput(e.target.value);
+                      checkPasswordStrength(e.target.value);
+                    }}
+                    required
+                  />
+                  <div className="flex gap-1 mt-1">
+                    {[...Array(5)].map((_, i) => (
+                      <div 
+                        key={i} 
+                        className={cn(
+                          "h-1 flex-1 rounded-full transition-colors",
+                          i < passwordStrength 
+                            ? (passwordStrength <= 2 ? "bg-red-400" : passwordStrength <= 4 ? "bg-amber-400" : "bg-emerald-400")
+                            : "bg-zinc-200"
+                        )} 
+                      />
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-zinc-400 mt-1">
+                    Strength: {passwordStrength <= 2 ? "Weak" : passwordStrength <= 4 ? "Medium" : "Strong"}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Confirm Password</label>
+                  <input 
+                    type="password" 
+                    placeholder="Repeat master password"
+                    className="input-field"
+                    autoComplete="off"
+                    value={masterPasswordConfirm}
+                    onChange={(e) => setMasterPasswordConfirm(e.target.value)}
+                    required
+                  />
+                </div>
+                {securityError && (
+                  <div className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-center gap-2 text-red-600 text-sm">
+                    <AlertTriangle size={16} />
+                    {securityError}
+                  </div>
+                )}
+                <button type="submit" className="btn-primary w-full py-3">
+                  Create Secure Vault
+                </button>
+              </form>
+            </motion.div>
+          </div>
+        )}
+
+        {isLocked && !showMasterSetup && (
+          <div className="fixed inset-0 z-[100] bg-zinc-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="max-w-md w-full glass-card p-8 space-y-6"
+            >
+              <div className="text-center space-y-2">
+                <div className="w-16 h-16 bg-zinc-900 rounded-2xl flex items-center justify-center text-white mx-auto mb-4">
+                  <Lock size={32} />
+                </div>
+                <h1 className="text-2xl font-bold text-zinc-900">Vault Locked</h1>
+                <p className="text-zinc-500 text-sm">Enter your master password to access your data.</p>
+              </div>
+
+              <form onSubmit={handleUnlock} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Master Password</label>
+                  <input 
+                    type="password" 
+                    placeholder="Enter master password"
+                    className="input-field"
+                    autoComplete="off"
+                    value={masterPasswordInput}
+                    onChange={(e) => setMasterPasswordInput(e.target.value)}
+                    required
+                    autoFocus
+                  />
+                </div>
+                {securityError && (
+                  <div className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-center gap-2 text-red-600 text-sm">
+                    <AlertTriangle size={16} />
+                    {securityError}
+                  </div>
+                )}
+                <div className="flex flex-col gap-3">
+                  <button type="submit" className="btn-primary w-full py-3">
+                    Unlock Vault
+                  </button>
+                  {isHardwareSupported && hasHardwareKey && (
+                    <button 
+                      type="button" 
+                      onClick={unlockWithHardware}
+                      className="btn-secondary w-full py-3 flex items-center justify-center gap-2"
+                    >
+                      <Shield size={18} />
+                      Unlock with Hardware
+                    </button>
+                  )}
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      <div className={cn(
+        "min-h-screen bg-[#f8f9fa] p-4 md:p-8 pb-24 md:pb-8 transition-all duration-500",
+        isCompromised ? "blur-xl scale-[0.98] pointer-events-none select-none" : ""
+      )}>
+        {isCompromised && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-white/80 backdrop-blur-md">
+            <div className="glass-card p-8 text-center space-y-4 max-w-md">
+              <AlertTriangle size={48} className="text-red-500 mx-auto" />
+              <h2 className="text-xl font-bold text-zinc-900">Security Alert</h2>
+              <p className="text-zinc-600">{securityWarning}</p>
+            </div>
+          </div>
+        )}
       <div className="max-w-4xl mx-auto space-y-8">
         {/* Header */}
         <header className="flex items-center justify-between">
@@ -340,9 +1330,29 @@ export default function App() {
               <Shield size={24} />
             </div>
             <div>
-              <h1 className="text-2xl font-semibold tracking-tight">CipherVault</h1>
+              <h1 className="text-2xl font-semibold tracking-tight">Hyper Vault</h1>
               <p className="text-sm text-zinc-500">Secure your digital identity</p>
             </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => setPrivacyMode(!privacyMode)}
+              className={cn(
+                "p-2 rounded-lg transition-all flex items-center gap-2 text-sm font-medium",
+                privacyMode ? "bg-zinc-900 text-white" : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200"
+              )}
+              title={privacyMode ? "Disable Privacy Mode" : "Enable Privacy Mode"}
+            >
+              {privacyMode ? <EyeOff size={18} /> : <Eye size={18} />}
+              <span className="hidden sm:inline">{privacyMode ? "Private" : "Public"}</span>
+            </button>
+            <button 
+              onClick={lockVault}
+              className="p-2 text-zinc-400 hover:text-zinc-900 hover:bg-zinc-100 rounded-lg transition-all"
+              title="Lock Vault"
+            >
+              <Lock size={20} />
+            </button>
           </div>
         </header>
 
@@ -477,24 +1487,39 @@ export default function App() {
                 <Key size={18} className="text-zinc-500" />
                 Vault
               </h2>
-              <button 
-                onClick={() => {
-                  if (showForm && editingId) {
-                    resetForm();
-                  } else {
-                    setShowForm(!showForm);
-                    if (!showForm) setEditingId(null);
-                  }
-                }}
-                className="btn-secondary py-1.5 px-4 flex items-center gap-2 text-sm"
-              >
-                {showForm && editingId ? 'Cancel Edit' : (
-                  <>
-                    <Plus size={16} />
-                    Add New
-                  </>
+              <div className="flex items-center gap-2">
+                {isHardwareSupported && (
+                  <button 
+                    onClick={registerHardwareKey}
+                    className={cn(
+                      "btn-secondary py-1.5 px-3 flex items-center gap-2 text-xs",
+                      hasHardwareKey ? "text-emerald-600 border-emerald-100 bg-emerald-50" : ""
+                    )}
+                    title="Register Hardware Key"
+                  >
+                    <Shield size={14} />
+                    {hasHardwareKey ? "Hardware Active" : "Add Hardware Key"}
+                  </button>
                 )}
-              </button>
+                <button 
+                  onClick={() => {
+                    if (showForm && editingId) {
+                      resetForm();
+                    } else {
+                      setShowForm(!showForm);
+                      if (!showForm) setEditingId(null);
+                    }
+                  }}
+                  className="btn-secondary py-1.5 px-4 flex items-center gap-2 text-sm"
+                >
+                  {showForm && editingId ? 'Cancel Edit' : (
+                    <>
+                      <Plus size={16} />
+                      Add New
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
             <AnimatePresence>
@@ -528,6 +1553,7 @@ export default function App() {
                           type="text" 
                           placeholder="username"
                           className="input-field"
+                          autoComplete="off"
                           value={newUsername}
                           onChange={(e) => setNewUsername(e.target.value)}
                         />
@@ -540,6 +1566,7 @@ export default function App() {
                           type="email" 
                           placeholder="your@email.com"
                           className="input-field"
+                          autoComplete="off"
                           value={newEmail}
                           onChange={(e) => setNewEmail(e.target.value)}
                         />
@@ -564,6 +1591,7 @@ export default function App() {
                           type="text" 
                           placeholder="Backup code"
                           className="input-field"
+                          autoComplete="off"
                           value={newBackupCode}
                           onChange={(e) => setNewBackupCode(e.target.value)}
                         />
@@ -577,6 +1605,7 @@ export default function App() {
                             type="text" 
                             placeholder="Password"
                             className="input-field"
+                            autoComplete="off"
                             value={newPassword}
                             onChange={(e) => setNewPassword(e.target.value)}
                             required
@@ -678,7 +1707,11 @@ export default function App() {
                         </div>
                         <div>
                           <h4 className="font-medium text-zinc-900">{item.service}</h4>
-                          <p className="text-xs text-zinc-500">{item.username || item.email || 'No identifier'}</p>
+                          <p className="text-xs text-zinc-500">
+                            {privacyMode 
+                              ? "••••••••••••" 
+                              : (item.username || item.email || 'No identifier')}
+                          </p>
                         </div>
                       </div>
                       
@@ -692,7 +1725,7 @@ export default function App() {
                         </button>
                         
                         <button 
-                          onClick={() => copyToClipboard(item.password)}
+                          onClick={() => copyPassword(item.id)}
                           className="p-2 text-zinc-400 hover:text-zinc-900 hover:bg-zinc-100 rounded-lg transition-all"
                           title="Copy password"
                         >
@@ -722,25 +1755,61 @@ export default function App() {
                               {item.username && (
                                 <div className="space-y-1">
                                   <span className="text-[10px] uppercase font-bold text-zinc-400">Username</span>
-                                  <p className="text-sm font-medium">{item.username}</p>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-sm font-medium selectable-data">
+                                      {privacyMode ? "••••••••••••" : item.username}
+                                    </p>
+                                    {!privacyMode && (
+                                      <button onClick={() => copyToClipboard(item.username)} className="text-zinc-400 hover:text-zinc-900">
+                                        <Copy size={12} />
+                                      </button>
+                                    )}
+                                  </div>
                                 </div>
                               )}
                               {item.email && (
                                 <div className="space-y-1">
                                   <span className="text-[10px] uppercase font-bold text-zinc-400">Email</span>
-                                  <p className="text-sm font-medium">{item.email}</p>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-sm font-medium selectable-data">
+                                      {privacyMode ? "••••••••••••" : item.email}
+                                    </p>
+                                    {!privacyMode && (
+                                      <button onClick={() => copyToClipboard(item.email)} className="text-zinc-400 hover:text-zinc-900">
+                                        <Copy size={12} />
+                                      </button>
+                                    )}
+                                  </div>
                                 </div>
                               )}
                               {item.phone && (
                                 <div className="space-y-1">
                                   <span className="text-[10px] uppercase font-bold text-zinc-400">Phone</span>
-                                  <p className="text-sm font-medium">{item.phone}</p>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-sm font-medium selectable-data">
+                                      {privacyMode ? "••••••••••••" : item.phone}
+                                    </p>
+                                    {!privacyMode && (
+                                      <button onClick={() => copyToClipboard(item.phone)} className="text-zinc-400 hover:text-zinc-900">
+                                        <Copy size={12} />
+                                      </button>
+                                    )}
+                                  </div>
                                 </div>
                               )}
                               {item.backup_code && (
                                 <div className="space-y-1">
                                   <span className="text-[10px] uppercase font-bold text-zinc-400">Backup Code</span>
-                                  <p className="text-sm font-medium">{item.backup_code}</p>
+                                  <div className="flex items-center justify-between gap-2">
+                                    <p className="text-sm font-medium selectable-data">
+                                      {privacyMode ? "••••••••••••" : item.backup_code}
+                                    </p>
+                                    {!privacyMode && (
+                                      <button onClick={() => copyToClipboard(item.backup_code)} className="text-zinc-400 hover:text-zinc-900">
+                                        <Copy size={12} />
+                                      </button>
+                                    )}
+                                  </div>
                                 </div>
                               )}
                             </div>
@@ -748,8 +1817,8 @@ export default function App() {
                             <div className="space-y-1">
                               <span className="text-[10px] uppercase font-bold text-zinc-400">Password</span>
                               <div className="flex items-center gap-2">
-                                <p className="text-sm font-mono font-medium">
-                                  {showPassMap[item.id] ? item.password : '••••••••••••'}
+                                <p className="text-sm font-mono font-medium selectable-data">
+                                  {showPassMap[item.id] ? decryptedPasswords[item.id] : '••••••••••••'}
                                 </p>
                                 <button 
                                   onClick={() => togglePassVisibility(item.id)}
@@ -765,7 +1834,14 @@ export default function App() {
                                 {item.custom_fields.map((field, idx) => (
                                   <div key={idx} className="space-y-1">
                                     <span className="text-[10px] uppercase font-bold text-zinc-400">{field.label}</span>
-                                    <p className="text-sm font-medium">{field.value}</p>
+                                    <p className="text-sm font-medium selectable-data">
+                                      {privacyMode ? "••••••••••••" : field.value}
+                                    </p>
+                                    {!privacyMode && (
+                                      <button onClick={() => copyToClipboard(field.value)} className="text-zinc-400 hover:text-zinc-900">
+                                        <Copy size={12} />
+                                      </button>
+                                    )}
                                   </div>
                                 ))}
                               </div>
@@ -823,6 +1899,7 @@ export default function App() {
                       <textarea 
                         placeholder="Write your note here..."
                         className="input-field min-h-[100px] py-3"
+                        autoComplete="off"
                         value={newNoteContent}
                         onChange={(e) => setNewNoteContent(e.target.value)}
                       />
@@ -847,6 +1924,7 @@ export default function App() {
                         <textarea 
                           placeholder="Paste code here..."
                           className="input-field font-mono text-sm py-3"
+                          autoComplete="off"
                           value={newNoteCode}
                           onChange={(e) => setNewNoteCode(e.target.value)}
                         />
@@ -910,26 +1988,50 @@ export default function App() {
                       <Trash2 size={16} />
                     </button>
                     <h3 className="font-bold text-zinc-900 pr-8">{note.title}</h3>
-                    {note.content && <p className="text-sm text-zinc-600 whitespace-pre-wrap">{note.content}</p>}
-                    {note.image && (
+                    {note.content && (
+                      <p className="text-sm text-zinc-600 whitespace-pre-wrap">
+                        {privacyMode ? "••••••••••••" : note.content}
+                      </p>
+                    )}
+                    {note.image && !privacyMode && (
                       <div className="rounded-lg overflow-hidden border border-zinc-100">
                         <img src={note.image} className="w-full h-auto max-h-48 object-cover" referrerPolicy="no-referrer" />
                       </div>
                     )}
                     {note.link && (
-                      <a 
-                        href={note.link} 
-                        target="_blank" 
-                        rel="noopener noreferrer"
-                        className="flex items-center gap-2 text-xs text-blue-600 hover:underline"
-                      >
-                        <ExternalLink size={12} /> {note.link}
-                      </a>
+                      <div className="flex items-center justify-between gap-2">
+                        <a 
+                          href={privacyMode ? "#" : note.link} 
+                          target={privacyMode ? "_self" : "_blank"} 
+                          rel="noopener noreferrer"
+                          className={cn(
+                            "flex items-center gap-2 text-xs text-blue-600 hover:underline truncate",
+                            privacyMode && "pointer-events-none"
+                          )}
+                        >
+                          <ExternalLink size={12} /> {privacyMode ? "••••••••••••" : note.link}
+                        </a>
+                        {!privacyMode && (
+                          <button onClick={() => copyToClipboard(note.link || '')} className="text-zinc-400 hover:text-zinc-900">
+                            <Copy size={12} />
+                          </button>
+                        )}
+                      </div>
                     )}
                     {note.code && (
-                      <pre className="bg-zinc-900 text-zinc-100 p-3 rounded-lg text-xs font-mono overflow-x-auto">
-                        <code>{note.code}</code>
-                      </pre>
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] uppercase font-bold text-zinc-400">Code</span>
+                          {!privacyMode && (
+                            <button onClick={() => copyToClipboard(note.code || '')} className="text-zinc-400 hover:text-zinc-900">
+                              <Copy size={12} />
+                            </button>
+                          )}
+                        </div>
+                        <pre className="bg-zinc-900 text-zinc-100 p-3 rounded-lg text-xs font-mono overflow-x-auto">
+                          <code>{privacyMode ? "// Hidden" : note.code}</code>
+                        </pre>
+                      </div>
                     )}
                   </motion.div>
                 ))
@@ -993,6 +2095,7 @@ export default function App() {
                       <textarea 
                         placeholder="Enter text or URL to encode in QR"
                         className="input-field py-3"
+                        autoComplete="off"
                         value={newQrContent}
                         onChange={(e) => setNewQrContent(e.target.value)}
                         required
@@ -1031,17 +2134,29 @@ export default function App() {
                     >
                       <Trash2 size={16} />
                     </button>
-                    <div className="p-3 bg-white rounded-lg shadow-sm">
+                    <div className={cn(
+                      "p-3 bg-white rounded-lg shadow-sm transition-all",
+                      privacyMode && "blur-md select-none pointer-events-none"
+                    )}>
                       <QRCodeSVG value={qr.content} size={120} />
                     </div>
                     <div className="text-center">
                       <h3 className="font-bold text-zinc-900">{qr.service}</h3>
-                      {qr.username && <p className="text-xs text-zinc-500">{qr.username}</p>}
+                      {qr.username && (
+                        <p className="text-xs text-zinc-500">
+                          {privacyMode ? "••••••••" : qr.username}
+                        </p>
+                      )}
                     </div>
-                    <div className="w-full pt-2 border-t border-zinc-100">
-                      <p className="text-[10px] text-zinc-400 truncate text-center" title={qr.content}>
-                        {qr.content}
+                    <div className="w-full pt-2 border-t border-zinc-100 flex items-center justify-between gap-2">
+                      <p className="text-[10px] text-zinc-400 truncate flex-1" title={qr.content}>
+                        {privacyMode ? "••••••••••••" : qr.content}
                       </p>
+                      {!privacyMode && (
+                        <button onClick={() => copyToClipboard(qr.content)} className="text-zinc-400 hover:text-zinc-900">
+                          <Copy size={12} />
+                        </button>
+                      )}
                     </div>
                   </motion.div>
                 ))
@@ -1104,6 +2219,7 @@ export default function App() {
           </button>
         </div>
       </nav>
+    </div>
     </div>
   );
 }

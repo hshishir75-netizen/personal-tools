@@ -16,6 +16,7 @@ db.exec(`
     backup_code TEXT,
     password TEXT NOT NULL,
     custom_fields TEXT,
+    signature TEXT, -- HMAC-SHA256 of the entry's encrypted data
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -26,6 +27,7 @@ db.exec(`
     image TEXT, -- Base64 encoded image
     link TEXT,
     code TEXT,
+    signature TEXT, -- HMAC-SHA256 of the note's encrypted data
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -34,8 +36,20 @@ db.exec(`
     service TEXT NOT NULL,
     username TEXT,
     content TEXT NOT NULL,
+    signature TEXT, -- HMAC-SHA256 of the QR code's encrypted data
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    user_handle TEXT NOT NULL
+  );
 `);
 
 async function startServer() {
@@ -43,6 +57,46 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: '50mb' })); // Increase limit for base64 images
+
+  // Settings API (for Master Salt)
+  app.get("/api/settings/:key", (req, res) => {
+    try {
+      const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(req.params.key);
+      res.json({ value: row ? (row as any).value : null });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch setting" });
+    }
+  });
+
+  app.post("/api/settings", (req, res) => {
+    const { key, value } = req.body;
+    try {
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to save setting" });
+    }
+  });
+
+  // WebAuthn Routes
+  app.post("/api/webauthn/register", (req, res) => {
+    const { id, publicKey, userHandle } = req.body;
+    try {
+      db.prepare("INSERT OR REPLACE INTO webauthn_credentials (id, public_key, user_handle) VALUES (?, ?, ?)").run(id, publicKey, userHandle);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to register credential" });
+    }
+  });
+
+  app.get("/api/webauthn/credentials", (req, res) => {
+    try {
+      const credentials = db.prepare("SELECT * FROM webauthn_credentials").all();
+      res.json(credentials);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch credentials" });
+    }
+  });
 
   // Vault API
   app.get("/api/passwords", (req, res) => {
@@ -59,16 +113,16 @@ async function startServer() {
   });
 
   app.post("/api/passwords", (req, res) => {
-    const { service, username, email, phone, backup_code, password, custom_fields } = req.body;
+    const { service, username, email, phone, backup_code, password, custom_fields, signature } = req.body;
     if (!service || !password) {
       return res.status(400).json({ error: "Service and Password are required" });
     }
     try {
       const customFieldsJson = JSON.stringify(custom_fields || []);
       const info = db.prepare(`
-        INSERT INTO vault_entries (service, username, email, phone, backup_code, password, custom_fields) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(service, username, email, phone, backup_code, password, customFieldsJson);
+        INSERT INTO vault_entries (service, username, email, phone, backup_code, password, custom_fields, signature) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(service, username, email, phone, backup_code, password, customFieldsJson, signature);
       res.json({ id: info.lastInsertRowid });
     } catch (error) {
       res.status(500).json({ error: "Failed to save entry" });
@@ -77,14 +131,14 @@ async function startServer() {
 
   app.put("/api/passwords/:id", (req, res) => {
     const { id } = req.params;
-    const { service, username, email, phone, backup_code, password, custom_fields } = req.body;
+    const { service, username, email, phone, backup_code, password, custom_fields, signature } = req.body;
     try {
       const customFieldsJson = JSON.stringify(custom_fields || []);
       db.prepare(`
         UPDATE vault_entries 
-        SET service = ?, username = ?, email = ?, phone = ?, backup_code = ?, password = ?, custom_fields = ?
+        SET service = ?, username = ?, email = ?, phone = ?, backup_code = ?, password = ?, custom_fields = ?, signature = ?
         WHERE id = ?
-      `).run(service, username, email, phone, backup_code, password, customFieldsJson, id);
+      `).run(service, username, email, phone, backup_code, password, customFieldsJson, signature, id);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to update entry" });
@@ -112,9 +166,9 @@ async function startServer() {
   });
 
   app.post("/api/notes", (req, res) => {
-    const { title, content, image, link, code } = req.body;
+    const { title, content, image, link, code, signature } = req.body;
     try {
-      const info = db.prepare("INSERT INTO notes (title, content, image, link, code) VALUES (?, ?, ?, ?, ?)").run(title, content, image, link, code);
+      const info = db.prepare("INSERT INTO notes (title, content, image, link, code, signature) VALUES (?, ?, ?, ?, ?, ?)").run(title, content, image, link, code, signature);
       res.json({ id: info.lastInsertRowid });
     } catch (error) {
       res.status(500).json({ error: "Failed to save note" });
@@ -141,9 +195,9 @@ async function startServer() {
   });
 
   app.post("/api/qrcodes", (req, res) => {
-    const { service, username, content } = req.body;
+    const { service, username, content, signature } = req.body;
     try {
-      const info = db.prepare("INSERT INTO qrcodes (service, username, content) VALUES (?, ?, ?)").run(service, username, content);
+      const info = db.prepare("INSERT INTO qrcodes (service, username, content, signature) VALUES (?, ?, ?, ?)").run(service, username, content, signature);
       res.json({ id: info.lastInsertRowid });
     } catch (error) {
       res.status(500).json({ error: "Failed to save QR code" });
@@ -174,7 +228,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    // Silent startup
   });
 }
 
