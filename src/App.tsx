@@ -1104,9 +1104,9 @@ export default function App() {
       "min-h-screen transition-all duration-500",
       (!isWindowFocused || !isTabVisible) && "blur-2xl scale-[0.98] pointer-events-none select-none"
     )}>
-      <AnimatePresence>
+      <AnimatePresence mode="wait">
         {(!isWindowFocused || !isTabVisible) && (
-          <div className="fixed inset-0 z-[200] bg-zinc-900/40 backdrop-blur-3xl flex items-center justify-center">
+          <div key="privacy-overlay" className="fixed inset-0 z-[200] bg-zinc-900/40 backdrop-blur-3xl flex items-center justify-center">
             <motion.div 
               initial={{ opacity: 0, scale: 0.9 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -1124,7 +1124,7 @@ export default function App() {
         )}
 
         {showRootWarning && (
-          <div className="fixed inset-0 z-[150] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div key="root-warning" className="fixed inset-0 z-[150] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
             <motion.div 
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
@@ -1179,7 +1179,7 @@ export default function App() {
         )}
 
         {showMasterSetup && (
-          <div className="fixed inset-0 z-[100] bg-zinc-50 flex items-center justify-center p-4">
+          <div key="master-setup-overlay" className="fixed inset-0 z-[100] bg-zinc-50 flex items-center justify-center p-4">
             <motion.div 
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -1253,7 +1253,7 @@ export default function App() {
         )}
 
         {isLocked && !showMasterSetup && (
-          <div className="fixed inset-0 z-[100] bg-zinc-50 flex items-center justify-center p-4">
+          <div key="vault-locked-overlay" className="fixed inset-0 z-[100] bg-zinc-50 flex items-center justify-center p-4">
             <motion.div 
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
@@ -1522,9 +1522,10 @@ export default function App() {
               </div>
             </div>
 
-            <AnimatePresence>
+            <AnimatePresence mode="wait">
               {showForm && (
                 <motion.div 
+                  key="password-form"
                   initial={{ opacity: 0, y: -20 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -20 }}
@@ -1742,9 +1743,10 @@ export default function App() {
                       </div>
                     </div>
 
-                    <AnimatePresence>
+                    <AnimatePresence mode="wait">
                       {expandedId === item.id && (
                         <motion.div 
+                          key={`details-${item.id}`}
                           initial={{ height: 0, opacity: 0 }}
                           animate={{ height: 'auto', opacity: 1 }}
                           exit={{ height: 0, opacity: 0 }}
@@ -1875,9 +1877,10 @@ export default function App() {
               </button>
             </div>
 
-            <AnimatePresence>
+            <AnimatePresence mode="wait">
               {showNoteForm && (
                 <motion.div 
+                  key="note-form"
                   initial={{ opacity: 0, y: -20 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -20 }}
@@ -2058,9 +2061,10 @@ export default function App() {
               </button>
             </div>
 
-            <AnimatePresence>
+            <AnimatePresence mode="wait">
               {showQrForm && (
                 <motion.div 
+                  key="qr-form"
                   initial={{ opacity: 0, y: -20 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -20 }}
