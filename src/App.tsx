@@ -208,6 +208,33 @@ const deriveHash = async (password: Uint8Array, salt: Uint8Array) => {
   return hash;
 };
 
+const deriveKeyFromAnswer = async (answer: string, salt: Uint8Array) => {
+  const answerBuffer = stringToUint8Array(answer.toLowerCase().trim());
+  const baseKey = await window.crypto.subtle.importKey(
+    "raw",
+    answerBuffer,
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  
+  const derivedKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 600000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+  
+  zeroOut(answerBuffer);
+  return derivedKey;
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'generator' | 'vault' | 'notes'>('generator');
   
@@ -221,7 +248,12 @@ export default function App() {
   const [showMasterSetup, setShowMasterSetup] = useState(false);
   const [masterPasswordInput, setMasterPasswordInput] = useState('');
   const [masterPasswordConfirm, setMasterPasswordConfirm] = useState('');
+  const [securityAnswer, setSecurityAnswer] = useState('');
   const [securityError, setSecurityError] = useState('');
+  const [showRecovery, setShowRecovery] = useState(false);
+  const [recoveryAnswerInput, setRecoveryAnswerInput] = useState('');
+  const [recoveryError, setRecoveryError] = useState('');
+  const [recoverySuccessPin, setRecoverySuccessPin] = useState<string | null>(null);
   const [lastActivity, setLastActivity] = useState(Date.now());
   const [failedAttempts, setFailedAttempts] = useState(0);
   const [lockoutUntil, setLockoutUntil] = useState<number | null>(null);
@@ -559,6 +591,7 @@ export default function App() {
       const saltValue = await storage.getSetting('master_salt');
       const authSaltValue = await storage.getSetting('auth_salt');
       const authHashValue = await storage.getSetting('auth_hash');
+      const recoverySaltValue = await storage.getSetting('recovery_salt');
 
       if (saltValue && authSaltValue && authHashValue) {
         setMasterSalt(new Uint8Array(base64ToBuffer(saltValue)));
@@ -598,21 +631,35 @@ export default function App() {
       setSecurityError("PINs do not match");
       return;
     }
+    if (securityAnswer.length < 3) {
+      setSecurityError("Security answer should be at least 3 characters");
+      return;
+    }
 
     const mSalt = window.crypto.getRandomValues(new Uint8Array(16));
     const aSalt = window.crypto.getRandomValues(new Uint8Array(16));
+    const rSalt = window.crypto.getRandomValues(new Uint8Array(16));
     
     try {
       const passwordBuffer1 = stringToUint8Array(masterPasswordInput);
       const passwordBuffer2 = stringToUint8Array(masterPasswordInput);
+      const pinToEncrypt = masterPasswordInput; // Keep a copy for encryption
+      
       setMasterPasswordInput('');
       setMasterPasswordConfirm('');
+      setSecurityAnswer('');
       
       const aHash = await deriveHash(passwordBuffer1, aSalt);
+
+      // Derive recovery key from security answer
+      const recoveryKey = await deriveKeyFromAnswer(securityAnswer, rSalt);
+      const encryptedPin = await encrypt(pinToEncrypt, recoveryKey);
 
       await storage.saveSetting('master_salt', bufferToBase64(mSalt));
       await storage.saveSetting('auth_salt', bufferToBase64(aSalt));
       await storage.saveSetting('auth_hash', aHash);
+      await storage.saveSetting('recovery_salt', bufferToBase64(rSalt));
+      await storage.saveSetting('encrypted_pin', encryptedPin);
       
       const { encryptionKey, integrityKey: iKey } = await deriveKey(passwordBuffer2, mSalt);
       setMasterKey(encryptionKey);
@@ -626,6 +673,70 @@ export default function App() {
       setLastActivity(Date.now());
     } catch (err) {
       setSecurityError("Failed to save security settings");
+    }
+  };
+
+  const handleRecovery = async (e: FormEvent) => {
+    e.preventDefault();
+    try {
+      const rSaltValue = await storage.getSetting('recovery_salt');
+      const encPin = await storage.getSetting('encrypted_pin');
+      
+      if (!rSaltValue || !encPin) {
+        setRecoveryError("Recovery data not found.");
+        return;
+      }
+
+      const rSalt = new Uint8Array(base64ToBuffer(rSaltValue));
+      const recoveryKey = await deriveKeyFromAnswer(recoveryAnswerInput, rSalt);
+      
+      try {
+        const decryptedPin = await decrypt(encPin, recoveryKey);
+        if (!decryptedPin || decryptedPin === "[Decryption Failed]") throw new Error("Decryption failed");
+
+        setRecoverySuccessPin(decryptedPin);
+        setRecoveryError('');
+      } catch (e) {
+        setRecoveryError("Incorrect answer. Please try again.");
+      }
+    } catch (err) {
+      setRecoveryError("Recovery failed. Please try again.");
+    }
+  };
+
+  const proceedWithRecoveredPin = async () => {
+    if (!recoverySuccessPin) return;
+    
+    try {
+      const pin = recoverySuccessPin;
+      const passwordBuffer2 = stringToUint8Array(pin);
+      
+      const mSaltValue = await storage.getSetting('master_salt');
+      const aSaltValue = await storage.getSetting('auth_salt');
+      const aHashValue = await storage.getSetting('auth_hash');
+      
+      if (!mSaltValue || !aSaltValue || !aHashValue) throw new Error("Vault data missing");
+
+      const mSalt = new Uint8Array(base64ToBuffer(mSaltValue));
+      const aSalt = new Uint8Array(base64ToBuffer(aSaltValue));
+
+      const { encryptionKey, integrityKey: iKey } = await deriveKey(passwordBuffer2, mSalt);
+      
+      setMasterKey(encryptionKey);
+      setIntegrityKey(iKey);
+      setMasterSalt(mSalt);
+      setAuthSalt(aSalt);
+      setAuthHash(aHashValue);
+      setIsLocked(false);
+      setShowRecovery(false);
+      setRecoverySuccessPin(null);
+      setRecoveryAnswerInput('');
+      setLastActivity(Date.now());
+      
+      fetchPasswords(encryptionKey, iKey);
+      fetchNotes(encryptionKey, iKey);
+    } catch (err) {
+      setRecoveryError("Failed to unlock vault with recovered PIN.");
     }
   };
 
@@ -1187,6 +1298,19 @@ export default function App() {
                     required
                   />
                 </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Security Question: What is your pet's name?</label>
+                  <input 
+                    type="text" 
+                    placeholder="Your answer"
+                    className="input-field"
+                    autoComplete="off"
+                    value={securityAnswer}
+                    onChange={(e) => setSecurityAnswer(e.target.value)}
+                    required
+                  />
+                  <p className="text-[10px] text-zinc-400 italic">This will be used if you forget your PIN.</p>
+                </div>
                 {securityError && (
                   <div className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-center gap-2 text-red-600 text-sm">
                     <AlertTriangle size={16} />
@@ -1243,6 +1367,13 @@ export default function App() {
                   <button type="submit" className="btn-primary w-full py-3">
                     Unlock Vault
                   </button>
+                  <button 
+                    type="button" 
+                    onClick={() => setShowRecovery(true)}
+                    className="text-xs text-zinc-400 hover:text-zinc-900 transition-colors text-center"
+                  >
+                    Forgot PIN?
+                  </button>
                   {isHardwareSupported && hasHardwareKey && (
                     <button 
                       type="button" 
@@ -1255,6 +1386,81 @@ export default function App() {
                   )}
                 </div>
               </form>
+            </motion.div>
+          </div>
+        )}
+
+        {showRecovery && (
+          <div key="recovery-overlay" className="fixed inset-0 z-[150] bg-zinc-900/40 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="max-w-sm w-full bg-white rounded-3xl shadow-2xl p-8 space-y-6 border border-zinc-200"
+            >
+              <div className="text-center space-y-2">
+                <div className="w-12 h-12 bg-zinc-100 rounded-xl flex items-center justify-center text-zinc-900 mx-auto mb-2">
+                  <RefreshCw size={24} />
+                </div>
+                <h2 className="text-xl font-bold text-zinc-900">Account Recovery</h2>
+                {!recoverySuccessPin ? (
+                  <p className="text-zinc-500 text-sm">Security Question:<br/><span className="font-medium text-zinc-900">What is your pet's name?</span></p>
+                ) : (
+                  <p className="text-zinc-500 text-sm">Recovery Successful!<br/><span className="text-xs">Your Master PIN has been recovered.</span></p>
+                )}
+              </div>
+
+              {!recoverySuccessPin ? (
+                <form onSubmit={handleRecovery} className="space-y-4">
+                  <div className="space-y-1.5">
+                    <input 
+                      type="text" 
+                      placeholder="Enter your answer"
+                      className="input-field text-center"
+                      autoComplete="off"
+                      value={recoveryAnswerInput}
+                      onChange={(e) => setRecoveryAnswerInput(e.target.value)}
+                      required
+                      autoFocus
+                    />
+                  </div>
+                  {recoveryError && (
+                    <div className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-center gap-2 text-red-600 text-sm">
+                      <AlertTriangle size={16} />
+                      {recoveryError}
+                    </div>
+                  )}
+                  <div className="flex gap-3">
+                    <button 
+                      type="button" 
+                      onClick={() => {
+                        setShowRecovery(false);
+                        setRecoveryAnswerInput('');
+                        setRecoveryError('');
+                      }}
+                      className="flex-1 py-3 text-zinc-500 font-medium hover:bg-zinc-100 rounded-xl transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button type="submit" className="flex-1 btn-primary py-3">
+                      Recover
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <div className="space-y-6">
+                  <div className="p-6 bg-zinc-900 rounded-2xl text-center space-y-2">
+                    <p className="text-zinc-400 text-xs uppercase tracking-widest font-bold">Your Master PIN</p>
+                    <p className="text-4xl font-bold text-white tracking-[0.2em]">{recoverySuccessPin}</p>
+                  </div>
+                  <button 
+                    onClick={proceedWithRecoveredPin}
+                    className="w-full btn-primary py-4 text-lg"
+                  >
+                    Unlock & Continue
+                  </button>
+                </div>
+              )}
             </motion.div>
           </div>
         )}
