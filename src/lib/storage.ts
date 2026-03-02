@@ -7,7 +7,6 @@ const STORES = {
   SETTINGS: 'settings',
   PASSWORDS: 'passwords',
   NOTES: 'notes',
-  QRCODES: 'qrcodes',
   WEBAUTHN: 'webauthn'
 };
 
@@ -56,7 +55,6 @@ const migrateFromLocalStorage = async () => {
   const arrayKeys = {
     [STORES.PASSWORDS]: 'hv_passwords',
     [STORES.NOTES]: 'hv_notes',
-    [STORES.QRCODES]: 'hv_qrcodes',
     [STORES.WEBAUTHN]: 'hv_webauthn'
   };
 
@@ -129,23 +127,6 @@ export const storage = {
   deleteNote: async (id: number) => {
     const db = await getDB();
     await db.delete(STORES.NOTES, Number(id));
-  },
-
-  getQrcodes: async () => {
-    const db = await getDB();
-    return db.getAll(STORES.QRCODES);
-  },
-
-  saveQrcode: async (qrcode: any) => {
-    const db = await getDB();
-    const newQrcode = { ...qrcode, created_at: new Date().toISOString() };
-    const id = await db.add(STORES.QRCODES, newQrcode);
-    return { ...newQrcode, id };
-  },
-
-  deleteQrcode: async (id: number) => {
-    const db = await getDB();
-    await db.delete(STORES.QRCODES, Number(id));
   },
 
   getWebAuthnCredentials: async () => {

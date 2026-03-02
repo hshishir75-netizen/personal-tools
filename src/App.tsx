@@ -16,7 +16,6 @@ import {
   Unlock,
   Edit2,
   FileText,
-  QrCode,
   Link as LinkIcon,
   Code,
   Image as ImageIcon,
@@ -27,7 +26,6 @@ import {
   AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { QRCodeSVG } from 'qrcode.react';
 import { cn } from './lib/utils';
 
 import { storage } from './lib/storage';
@@ -51,14 +49,6 @@ interface Note {
   image?: string;
   link?: string;
   code?: string;
-  created_at: string;
-}
-
-interface SavedQRCode {
-  id: number;
-  service: string;
-  username?: string;
-  content: string;
   created_at: string;
 }
 
@@ -219,7 +209,7 @@ const deriveHash = async (password: Uint8Array, salt: Uint8Array) => {
 };
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'generator' | 'vault' | 'notes' | 'qr'>('generator');
+  const [activeTab, setActiveTab] = useState<'generator' | 'vault' | 'notes'>('generator');
   
   // Security State
   const [masterKey, setMasterKey] = useState<CryptoKey | null>(null);
@@ -267,7 +257,7 @@ export default function App() {
   const [reauthError, setReauthError] = useState('');
   const [pendingItem, setPendingItem] = useState<any | null>(null);
   const [pendingAction, setPendingAction] = useState<'edit' | 'delete' | null>(null);
-  const [pendingType, setPendingType] = useState<'password' | 'note' | 'qr' | null>(null);
+  const [pendingType, setPendingType] = useState<'password' | 'note' | null>(null);
   const [isWindowFocused, setIsWindowFocused] = useState(true);
   const [isTabVisible, setIsTabVisible] = useState(true);
   const [isCompromised, setIsCompromised] = useState(false);
@@ -286,13 +276,6 @@ export default function App() {
   const [newNoteImage, setNewNoteImage] = useState<string | null>(null);
   const [newNoteLink, setNewNoteLink] = useState('');
   const [newNoteCode, setNewNoteCode] = useState('');
-
-  // QR state
-  const [qrcodes, setQrcodes] = useState<SavedQRCode[]>([]);
-  const [showQrForm, setShowQrForm] = useState(false);
-  const [newQrService, setNewQrService] = useState('');
-  const [newQrUsername, setNewQrUsername] = useState('');
-  const [newQrContent, setNewQrContent] = useState('');
 
   useEffect(() => {
     const checkEnvironment = () => {
@@ -499,7 +482,6 @@ export default function App() {
     setIsLocked(true);
     setSavedPasswords([]);
     setNotes([]);
-    setQrcodes([]);
     setDecryptedPasswords({});
     setShowPassMap({});
     setMasterPasswordInput('');
@@ -508,7 +490,6 @@ export default function App() {
     setNewPassword('');
     setNewNoteContent('');
     setNewNoteCode('');
-    setNewQrContent('');
     setSecurityError('');
     
     // Force a re-render to ensure memory is cleared
@@ -693,7 +674,6 @@ export default function App() {
       // Fetch data after unlocking
       fetchPasswords(encryptionKey, iKey);
       fetchNotes(encryptionKey, iKey);
-      fetchQrcodes(encryptionKey, iKey);
     } catch (err) {
       setSecurityError("Security error during unlock");
     }
@@ -821,7 +801,7 @@ export default function App() {
     setReauthError('');
   };
 
-  const startDelete = (item: any, type: 'password' | 'note' | 'qr') => {
+  const startDelete = (item: any, type: 'password' | 'note') => {
     setPendingItem(item);
     setPendingAction('delete');
     setPendingType(type);
@@ -861,9 +841,6 @@ export default function App() {
         } else if (pendingType === 'note') {
           await storage.deleteNote(pendingItem.id);
           fetchNotes();
-        } else if (pendingType === 'qr') {
-          await storage.deleteQrcode(pendingItem.id);
-          fetchQrcodes();
         }
         setShowReauthModal(false);
         setPendingItem(null);
@@ -997,77 +974,6 @@ export default function App() {
         setNewNoteImage(reader.result as string);
       };
       reader.readAsDataURL(file);
-    }
-  };
-
-  const fetchQrcodes = async (keyOverride?: CryptoKey, iKeyOverride?: CryptoKey) => {
-    const key = keyOverride || masterKey;
-    const iKey = iKeyOverride || integrityKey;
-    if (!key || !iKey) return;
-    try {
-      const data = await storage.getQrcodes();
-      
-      const decryptedData = await Promise.all(data.map(async (item: any) => {
-        // Integrity Verification
-        if (item.signature) {
-          const payload = [
-            item.service,
-            item.username,
-            item.content
-          ].join('|');
-          
-          const isValid = await verifyData(payload, item.signature, iKey);
-          if (!isValid) {
-            setIsCompromised(true);
-            setSecurityWarning("Vault integrity check failed. Data tampering detected in QR codes.");
-            throw new Error("Integrity check failed");
-          }
-        }
-
-        return {
-          ...item,
-          service: await decrypt(item.service, key),
-          username: await decrypt(item.username, key),
-          content: await decrypt(item.content, key)
-        };
-      }));
-      
-      setQrcodes(decryptedData);
-    } catch (err) {
-      if (err instanceof Error && err.message === "Integrity check failed") {
-        // Handled by state
-      }
-    }
-  };
-
-  const saveQrcode = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!newQrService || !newQrContent || !masterKey || !integrityKey) return;
-
-    try {
-      const encryptedData = {
-        service: await encrypt(newQrService, masterKey),
-        username: await encrypt(newQrUsername, masterKey),
-        content: await encrypt(newQrContent, masterKey)
-      };
-
-      const payload = [
-        encryptedData.service,
-        encryptedData.username,
-        encryptedData.content
-      ].join('|');
-
-      const signature = await signData(payload, integrityKey);
-
-      await storage.saveQrcode({ ...encryptedData, signature });
-      
-      setNewQrService('');
-      setNewQrUsername('');
-      setNewQrContent('');
-      setShowQrForm(false);
-      fetchQrcodes();
-    } catch (err) {
-      // Silent error
     }
   };
 
@@ -2146,131 +2052,7 @@ export default function App() {
             </div>
           </section>
 
-          {/* QR Code Section */}
-          <section className={cn(
-            "lg:col-span-12 space-y-6",
-            activeTab !== 'qr' && "hidden"
-          )}>
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-medium flex items-center gap-2">
-                <QrCode size={18} className="text-zinc-500" />
-                QR Code Generator
-              </h2>
-              <button 
-                onClick={() => setShowQrForm(!showQrForm)}
-                className="btn-secondary py-1.5 px-4 flex items-center gap-2 text-sm"
-              >
-                <Plus size={16} />
-                Generate QR
-              </button>
-            </div>
-
-            <AnimatePresence mode="wait">
-              {showQrForm && (
-                <motion.div 
-                  key="qr-form"
-                  initial={{ opacity: 0, y: -20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="glass-card p-6 border-zinc-200"
-                >
-                  <form onSubmit={saveQrcode} className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Service</label>
-                        <input 
-                          type="text" 
-                          placeholder="e.g. WiFi, Website"
-                          className="input-field"
-                          value={newQrService}
-                          onChange={(e) => setNewQrService(e.target.value)}
-                          required
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Username (Optional)</label>
-                        <input 
-                          type="text" 
-                          placeholder="username"
-                          className="input-field"
-                          value={newQrUsername}
-                          onChange={(e) => setNewQrUsername(e.target.value)}
-                        />
-                      </div>
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold uppercase tracking-wider text-zinc-500">QR Content</label>
-                      <textarea 
-                        placeholder="Enter text or URL to encode in QR"
-                        className="input-field py-3"
-                        autoComplete="off"
-                        value={newQrContent}
-                        onChange={(e) => setNewQrContent(e.target.value)}
-                        required
-                      />
-                    </div>
-                    <div className="flex justify-center p-4 bg-zinc-50 rounded-xl">
-                      {newQrContent ? (
-                        <QRCodeSVG value={newQrContent} size={160} />
-                      ) : (
-                        <div className="w-40 h-40 bg-zinc-100 rounded flex items-center justify-center text-zinc-400 text-xs">
-                          Preview will appear here
-                        </div>
-                      )}
-                    </div>
-                    <div className="flex gap-3 pt-4 border-t border-zinc-100">
-                      <button type="submit" className="btn-primary flex-1 py-3">Save QR Code</button>
-                      <button type="button" onClick={() => setShowQrForm(false)} className="btn-secondary py-3">Cancel</button>
-                    </div>
-                  </form>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {qrcodes.length === 0 ? (
-                <div className="col-span-full glass-card p-12 text-center space-y-3 border-dashed border-zinc-300 bg-transparent">
-                  <QrCode size={24} className="mx-auto text-zinc-400" />
-                  <p className="text-zinc-500">No QR codes saved yet.</p>
-                </div>
-              ) : (
-                qrcodes.map((qr) => (
-                  <motion.div layout key={qr.id} className="glass-card p-4 flex flex-col items-center space-y-3 relative group">
-                    <button 
-                      onClick={() => startDelete(qr, 'qr')}
-                      className="absolute top-2 right-2 p-2 text-zinc-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                    <div className={cn(
-                      "p-3 bg-white rounded-lg shadow-sm transition-all",
-                      privacyMode && "blur-md select-none pointer-events-none"
-                    )}>
-                      <QRCodeSVG value={qr.content} size={120} />
-                    </div>
-                    <div className="text-center">
-                      <h3 className="font-bold text-zinc-900">{qr.service}</h3>
-                      {qr.username && (
-                        <p className="text-xs text-zinc-500">
-                          {privacyMode ? "••••••••" : qr.username}
-                        </p>
-                      )}
-                    </div>
-                    <div className="w-full pt-2 border-t border-zinc-100 flex items-center justify-between gap-2">
-                      <p className="text-[10px] text-zinc-400 truncate flex-1" title={qr.content}>
-                        {privacyMode ? "••••••••••••" : qr.content}
-                      </p>
-                      {!privacyMode && (
-                        <button onClick={() => copyToClipboard(qr.content)} className="text-zinc-400 hover:text-zinc-900">
-                          <Copy size={12} />
-                        </button>
-                      )}
-                    </div>
-                  </motion.div>
-                ))
-              )}
-            </div>
-          </section>
+          {/* Notes Section */}
         </div>
       </div>
 
@@ -2312,18 +2094,6 @@ export default function App() {
           >
             <FileText size={18} />
             Notes
-          </button>
-          <button
-            onClick={() => setActiveTab('qr')}
-            className={cn(
-              "flex flex-col items-center gap-1 px-3 py-2 rounded-xl transition-all text-[10px] font-medium",
-              activeTab === 'qr' 
-                ? "bg-white text-zinc-900 shadow-sm" 
-                : "text-zinc-400 hover:text-white"
-            )}
-          >
-            <QrCode size={18} />
-            QR
           </button>
         </div>
       </nav>
