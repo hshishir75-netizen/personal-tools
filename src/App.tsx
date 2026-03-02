@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, FormEvent, ChangeEvent } from 'react';
 import { 
   Shield, 
+  ShieldCheck,
   RefreshCw, 
   Copy, 
   Plus, 
@@ -261,6 +262,12 @@ export default function App() {
   const [customFields, setCustomFields] = useState<{ label: string; value: string }[]>([]);
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [showReauthModal, setShowReauthModal] = useState(false);
+  const [reauthPin, setReauthPin] = useState('');
+  const [reauthError, setReauthError] = useState('');
+  const [pendingItem, setPendingItem] = useState<any | null>(null);
+  const [pendingAction, setPendingAction] = useState<'edit' | 'delete' | null>(null);
+  const [pendingType, setPendingType] = useState<'password' | 'note' | 'qr' | null>(null);
   const [isWindowFocused, setIsWindowFocused] = useState(true);
   const [isTabVisible, setIsTabVisible] = useState(true);
   const [isCompromised, setIsCompromised] = useState(false);
@@ -342,6 +349,10 @@ export default function App() {
     window.addEventListener('offline', handleOffline);
     document.addEventListener('contextmenu', preventContextMenu);
 
+    // Initial Security and Hardware Checks
+    checkSecurity();
+    checkHardwareSupport();
+
     return () => {
       clearInterval(devToolsInterval);
       window.removeEventListener('focus', handleFocus);
@@ -375,8 +386,6 @@ export default function App() {
 
   useEffect(() => {
     generatePassword();
-    checkSecurity();
-    checkHardwareSupport();
   }, [generatePassword]);
 
   const checkHardwareSupport = async () => {
@@ -803,23 +812,83 @@ export default function App() {
     setEditingId(null);
   };
 
-  const startEdit = async (item: SavedPassword) => {
-    if (!masterKey) return;
+  const startEdit = (item: SavedPassword) => {
+    setPendingItem(item);
+    setPendingAction('edit');
+    setPendingType('password');
+    setShowReauthModal(true);
+    setReauthPin('');
+    setReauthError('');
+  };
+
+  const startDelete = (item: any, type: 'password' | 'note' | 'qr') => {
+    setPendingItem(item);
+    setPendingAction('delete');
+    setPendingType(type);
+    setShowReauthModal(true);
+    setReauthPin('');
+    setReauthError('');
+  };
+
+  const executePendingAction = async () => {
+    if (!pendingItem || !pendingAction || !masterKey) return;
+
+    if (pendingAction === 'edit' && pendingType === 'password') {
+      try {
+        const decryptedPass = await decrypt(pendingItem.password, masterKey);
+        setNewService(pendingItem.service);
+        setNewUsername(pendingItem.username || '');
+        setNewEmail(pendingItem.email || '');
+        setNewPhone(pendingItem.phone || '');
+        setNewBackupCode(pendingItem.backup_code || '');
+        setNewPassword(decryptedPass);
+        setCustomFields(pendingItem.custom_fields || []);
+        setEditingId(pendingItem.id);
+        setShowForm(true);
+        setShowReauthModal(false);
+        setPendingItem(null);
+        setPendingAction(null);
+        setPendingType(null);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } catch (e) {
+        setReauthError("Decryption failed.");
+      }
+    } else if (pendingAction === 'delete') {
+      try {
+        if (pendingType === 'password') {
+          await storage.deletePassword(pendingItem.id);
+          fetchPasswords();
+        } else if (pendingType === 'note') {
+          await storage.deleteNote(pendingItem.id);
+          fetchNotes();
+        } else if (pendingType === 'qr') {
+          await storage.deleteQrcode(pendingItem.id);
+          fetchQrcodes();
+        }
+        setShowReauthModal(false);
+        setPendingItem(null);
+        setPendingAction(null);
+        setPendingType(null);
+      } catch (err) {
+        setReauthError("Deletion failed.");
+      }
+    }
+  };
+
+  const handleReauth = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!authSalt || !authHash) return;
+
     try {
-      const decryptedPass = await decrypt(item.password, masterKey);
-      setNewService(item.service);
-      setNewUsername(item.username || '');
-      setNewEmail(item.email || '');
-      setNewPhone(item.phone || '');
-      setNewBackupCode(item.backup_code || '');
-      setNewPassword(decryptedPass);
-      setCustomFields(item.custom_fields || []);
-      setEditingId(item.id);
-      setShowForm(true);
-      // Scroll to form or ensure it's visible
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    } catch (e) {
-      // Silent error
+      const passwordBuffer = stringToUint8Array(reauthPin);
+      const inputHash = await deriveHash(passwordBuffer, authSalt);
+      if (inputHash === authHash) {
+        executePendingAction();
+      } else {
+        setReauthError("Invalid PIN. Please try again.");
+      }
+    } catch (err) {
+      setReauthError("Authentication failed.");
     }
   };
 
@@ -835,15 +904,6 @@ export default function App() {
 
   const removeCustomField = (index: number) => {
     setCustomFields(customFields.filter((_, i) => i !== index));
-  };
-
-  const deletePassword = async (id: number) => {
-    try {
-      await storage.deletePassword(id);
-      fetchPasswords();
-    } catch (err) {
-      // Silent error
-    }
   };
 
   const fetchNotes = async (keyOverride?: CryptoKey, iKeyOverride?: CryptoKey) => {
@@ -929,15 +989,6 @@ export default function App() {
     }
   };
 
-  const deleteNote = async (id: number) => {
-    try {
-      await storage.deleteNote(id);
-      fetchNotes();
-    } catch (err) {
-      // Silent error
-    }
-  };
-
   const handleImageUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -1014,15 +1065,6 @@ export default function App() {
       setNewQrUsername('');
       setNewQrContent('');
       setShowQrForm(false);
-      fetchQrcodes();
-    } catch (err) {
-      // Silent error
-    }
-  };
-
-  const deleteQrcode = async (id: number) => {
-    try {
-      await storage.deleteQrcode(id);
       fetchQrcodes();
     } catch (err) {
       // Silent error
@@ -1305,6 +1347,65 @@ export default function App() {
                       Unlock with Hardware
                     </button>
                   )}
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+
+        {showReauthModal && (
+          <div key="reauth-overlay" className="fixed inset-0 z-[150] bg-zinc-900/40 backdrop-blur-sm flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="max-w-sm w-full bg-white rounded-3xl shadow-2xl p-8 space-y-6 border border-zinc-200"
+            >
+              <div className="text-center space-y-2">
+                <div className="w-12 h-12 bg-zinc-100 rounded-xl flex items-center justify-center text-zinc-900 mx-auto mb-2">
+                  <ShieldCheck size={24} />
+                </div>
+                <h2 className="text-xl font-bold text-zinc-900">Security Check</h2>
+                <p className="text-zinc-500 text-sm">Please verify your Master PIN to {pendingAction} this entry.</p>
+              </div>
+
+              <form onSubmit={handleReauth} className="space-y-4">
+                <div className="space-y-1.5">
+                  <input 
+                    type="password" 
+                    placeholder="Enter PIN"
+                    className="input-field text-center text-2xl tracking-[1em] font-bold"
+                    autoComplete="off"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    maxLength={6}
+                    value={reauthPin}
+                    onChange={(e) => setReauthPin(e.target.value.replace(/[^0-9]/g, ''))}
+                    required
+                    autoFocus
+                  />
+                </div>
+                {reauthError && (
+                  <div className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-center gap-2 text-red-600 text-sm">
+                    <AlertTriangle size={16} />
+                    {reauthError}
+                  </div>
+                )}
+                <div className="flex gap-3">
+                  <button 
+                    type="button" 
+                    onClick={() => {
+                      setShowReauthModal(false);
+                      setPendingItem(null);
+                      setPendingAction(null);
+                    }}
+                    className="flex-1 py-3 text-zinc-500 font-medium hover:bg-zinc-100 rounded-xl transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button type="submit" className="flex-1 btn-primary py-3">
+                    Verify
+                  </button>
                 </div>
               </form>
             </motion.div>
@@ -1737,7 +1838,7 @@ export default function App() {
                         </button>
                         
                         <button 
-                          onClick={() => deletePassword(item.id)}
+                          onClick={() => startDelete(item, 'password')}
                           className="p-2 text-zinc-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
                           title="Delete"
                         >
@@ -1988,7 +2089,7 @@ export default function App() {
                 notes.map((note) => (
                   <motion.div layout key={note.id} className="glass-card p-4 space-y-3 relative group">
                     <button 
-                      onClick={() => deleteNote(note.id)}
+                      onClick={() => startDelete(note, 'note')}
                       className="absolute top-2 right-2 p-2 text-zinc-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
                     >
                       <Trash2 size={16} />
@@ -2136,7 +2237,7 @@ export default function App() {
                 qrcodes.map((qr) => (
                   <motion.div layout key={qr.id} className="glass-card p-4 flex flex-col items-center space-y-3 relative group">
                     <button 
-                      onClick={() => deleteQrcode(qr.id)}
+                      onClick={() => startDelete(qr, 'qr')}
                       className="absolute top-2 right-2 p-2 text-zinc-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
                     >
                       <Trash2 size={16} />
