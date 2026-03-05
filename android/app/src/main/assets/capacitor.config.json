@@ -1,0 +1,8 @@
+{
+	"appId": "com.hypervault.app",
+	"appName": "Hyper Vault",
+	"webDir": "dist",
+	"server": {
+		"androidScheme": "https"
+	}
+}
